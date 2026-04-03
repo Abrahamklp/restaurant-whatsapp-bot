@@ -1,6 +1,7 @@
 import os
 import json
-from fastapi import FastAPI, Form
+import logging
+from fastapi import FastAPI, Form, Request
 from fastapi.responses import Response
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -9,39 +10,87 @@ from sheets_logger import log_order, setup_sheet_headers
 
 load_dotenv()
 
-# ── INIT ─────────────────────────────────────────────
+# ── 1. STARTUP VALIDATION ──────────────────────────────────────────────────────
+REQUIRED_ENV_VARS = ["OPENAI_API_KEY", "GOOGLE_SHEET_ID", "GOOGLE_CREDENTIALS_JSON"]
+missing_vars = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
+if missing_vars:
+    raise RuntimeError(f"❌ Startup Failed. Missing Environment Variables: {', '.join(missing_vars)}")
+
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app = FastAPI()
 
-# ── MEMORY ───────────────────────────────────────────
+# ── 2. SMART PERSISTENT MEMORY ────────────────────────────────────────────────
 conversation_memory = {}
-MAX_HISTORY = 12  # reduced for speed
+MAX_HISTORY = 10  # Reduced for faster/cheaper responses & smarter trimming
 
-def get_history(phone: str):
-    return conversation_memory.setdefault(phone, [])
+def get_history(phone: str) -> list:
+    if phone not in conversation_memory:
+        conversation_memory[phone] = []
+    return conversation_memory[phone]
 
 def save_to_history(phone: str, role: str, content: str):
     history = get_history(phone)
     history.append({"role": role, "content": content})
+    # Keep memory lean: only the last 10 messages
     if len(history) > MAX_HISTORY:
         conversation_memory[phone] = history[-MAX_HISTORY:]
 
-# ── ORDER DETECTION ──────────────────────────────────
-ORDER_DETECTION_PROMPT = """
-Detect if the assistant CONFIRMED an order.
+# ── 3. ENHANCED SYSTEM PROMPT ──────────────────────────────────────────────────
+SYSTEM_PROMPT = """
+### ROLE
+You are "Zidi," the smart, witty, and highly efficient AI Waiter for Zidi Kitchen in Kasarani, Nairobi. You handle orders via WhatsApp with a blend of professional courtesy and local Kenyan warmth.
 
-Return ONLY JSON:
-{"is_order": true, "items": "...", "total": "...", "order_type": "..."}
-OR
-{"is_order": false}
+### PERSONALITY & LANGUAGE
+- Tone: Friendly, helpful, and "Mjanja" (smart). 
+- Language: Primary English, but you fluently understand and use Kenyan Swahili and Sheng (e.g., "Sawa," "Niaje," "Ondokea hiyo," "Leta mbili").
+- Context: You understand local food lingo. If someone asks for "Chips mwitu," "Kuku kienyeji," or "Soda baridi," you know exactly what they mean.
+
+### OPERATIONAL LOGIC & CONSTRAINTS
+1. GEOGRAPHIC LIMITS: You operate within Kasarani and its environs (Ruiru, Mwiki, Roysambu). 
+   - If a user requests delivery to an illogical location (e.g., Cairo Egypt, Mombasa, or Kisumu), politely decline. 
+   - Response style: "Aie zii! Cairo is a bit far for our riders. We only deliver within Kasarani/Ruiru for now. Ungependa kukuja pickup?"
+   
+2. MATH & COMBINATIONS: 
+   - Be a math whiz. Calculate totals instantly including quantities.
+   - Delivery fee: KES 100 flat (Free on orders above KES 1,200).
+   - Minimum delivery order: KES 400.
+
+3. ERROR HANDLING & COMPLAINTS:
+   - If a customer is angry or complaining (e.g., "Food was cold"), do not argue. 
+   - Respond: "Pole sana for that experience. I've noted this down and alerted the manager immediately to look into it. Give us a moment."
+   - Explicitly include the word "COMPLAINT" in your final order summary if the user is unhappy.
+
+4. ROBUSTNESS:
+   - Never break character. If the user sends gibberish, respond: "Sijashika hapo... could you please repeat your order clearly?"
+   - Do not hallucinate items not on the menu.
+
+### MENU (STRICT PRICES)
+BREAKFAST (7AM-11AM): Uji (80), Mandazi+Chai (100), Mahamri+Mbaazi (130), Full Breakfast (280).
+RICE: Pilau Beef (380), Pilau Chicken (350), Biryani Chicken (420), Biryani Beef (460).
+UGALI MEALS: Ugali Tilapia (450), Nyama Choma (580), Chicken Stew (380), Matumbo (300).
+SIDES/SNACKS: Chips (120), Masala Chips (150), Mutura (160), Samosa (130), Bhajia (120).
+DRINKS: Dawa (90), Mango/Passion Juice (130), Soda (70), Mineral Water (60).
+
+### OUTPUT FORMAT (FOR THE LOGGER)
+When an order is confirmed, summarize it strictly as:
+Items: [Item x Quantity]
+Total: KES [Amount]
+Type: [Delivery/Dine-in]
+Location: [User's Location]
+Status: [New/COMPLAINT]
 """
 
-def detect_and_log_order(phone, history, raw_message):
+# ── 4. ROBUST ORDER DETECTION ──────────────────────────────────────────────────
+ORDER_DETECTION_PROMPT = """
+Extract order details from the conversation. 
+Return ONLY valid JSON.
+Example: {"is_order": true, "items": "2x Pilau", "total": "760", "order_type": "Delivery", "is_complaint": false}
+"""
+
+def detect_and_log_order(phone: str, history: list, raw_message: str):
     try:
-        recent = history[-4:]
-        conversation_text = "\n".join(
-            f"{m['role']}: {m['content']}" for m in recent
-        )
+        recent = history[-2:] # Only check the absolute latest exchange for speed
+        conversation_text = "\n".join([f"{m['role']}: {m['content']}" for m in recent])
 
         result = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -49,18 +98,13 @@ def detect_and_log_order(phone, history, raw_message):
                 {"role": "system", "content": ORDER_DETECTION_PROMPT},
                 {"role": "user", "content": conversation_text},
             ],
-            max_tokens=120,
+            max_tokens=100,
         )
 
-        raw = result.choices[0].message.content.strip()
-
-        try:
-            parsed = json.loads(raw)
-        except:
-            print("⚠ JSON parse failed:", raw)
-            return
+        parsed = json.loads(result.choices[0].message.content.strip())
 
         if parsed.get("is_order"):
+            status = "COMPLAINT" if parsed.get("is_complaint") else "New"
             log_order(
                 phone=phone,
                 order_items=parsed.get("items", ""),
@@ -68,77 +112,50 @@ def detect_and_log_order(phone, history, raw_message):
                 order_type=parsed.get("order_type", "Unknown"),
                 raw_message=raw_message,
             )
-
     except Exception as e:
-        print("⚠ Order detection error:", e)
+        print(f"⚠ Logging bypass: {e}")
 
-# ── SYSTEM PROMPT ────────────────────────────────────
-SYSTEM_PROMPT = """You are Zidi, the smart, witty, and highly efficient AI Waiter for Zidi Kitchen in Kenya.
-
-Be friendly, Kenyan, and concise. Mix English, Swahili, and Sheng naturally.
-
-RULES:
-- Always confirm orders clearly with total price
-- Ask for location for delivery
-- Keep replies short (WhatsApp style)
-- Never invent menu items
-- Handle complaints politely
-- If unclear: "Sijashika hapo vizuri, unaweza repeat tafadhali?"
-
-When confirming orders, clearly list:
-Items, Total, Type (Delivery/Dine-in)
-"""
-
-# ── STARTUP ──────────────────────────────────────────
+# ── 5. BOT LOGIC WITH ERROR PROTECTION ────────────────────────────────────────
 @app.on_event("startup")
 async def startup_event():
     print("Starting Zidi Kitchen Bot...")
     setup_sheet_headers()
     print("✓ Bot ready")
 
-# ── ROUTES ───────────────────────────────────────────
-@app.get("/")
-def home():
-    return {"status": "Bot is running"}
-
 @app.post("/webhook/whatsapp")
 async def reply(From: str = Form(...), Body: str = Form(...)):
-    phone = From.replace("whatsapp:", "").strip()
-    message = Body.strip()
-
-    save_to_history(phone, "user", message)
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        *get_history(phone),
-    ]
-
-    # ✅ SAFE AI CALL
     try:
+        phone = From.replace("whatsapp:", "").strip()
+        message = Body.strip()
+
+        save_to_history(phone, "user", message)
+
+        # Get response from OpenAI
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            max_tokens=250,
+            model="gpt-4o-mini", # Faster + Cheaper
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                *get_history(phone),
+            ],
+            temperature=0.7 # Makes it feel more "human" and less like a robot
         )
         ai_msg = response.choices[0].message.content
+        save_to_history(phone, "assistant", ai_msg)
+
+        # Background logging (won't block user reply)
+        detect_and_log_order(phone, get_history(phone), message)
+
+        twiml = MessagingResponse()
+        twiml.message(ai_msg)
+        return Response(content=str(twiml), media_type="application/xml")
 
     except Exception as e:
-        print("❌ OpenAI Error:", e)
-        ai_msg = "Samahani, kuna delay kidogo. Try again shortly 🙏"
+        # FALLBACK: Prevent 500 error, send polite message instead
+        print(f"❌ CRASH PREVENTED: {e}")
+        twiml = MessagingResponse()
+        twiml.message("Pole sana! Zidi is experiencing a small hitch. Please try again in a few seconds or call us at 0701234567.")
+        return Response(content=str(twiml), media_type="application/xml")
 
-    save_to_history(phone, "assistant", ai_msg)
-
-    detect_and_log_order(phone, get_history(phone), message)
-
-    twiml = MessagingResponse()
-    twiml.message(ai_msg)
-
-    return Response(content=str(twiml), media_type="application/xml")
-
-# ── DEBUG ────────────────────────────────────────────
-@app.get("/memory/check")
-def check_memory():
-    return {
-        "active_conversations": len(conversation_memory),
-        "customers": list(conversation_memory.keys()),
-    }
+@app.get("/")
+def health_check():
+    return {"status": "online", "bot": "Zidi Kitchen"}
