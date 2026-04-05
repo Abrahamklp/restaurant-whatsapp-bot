@@ -196,7 +196,6 @@ Reply ONLY with valid JSON. No extra text. Examples:
 
 def detect_and_log_order(phone: str, history: list, raw_message: str):
     try:
-        # Check last 6 messages (3 exchanges) — enough context to catch multi-step orders
         recent = history[-6:] if len(history) >= 6 else history
         conversation_text = "\n".join(
             f"{m['role'].upper()}: {m['content']}" for m in recent
@@ -214,23 +213,40 @@ def detect_and_log_order(phone: str, history: list, raw_message: str):
         raw = result.choices[0].message.content.strip()
         parsed = json.loads(raw)
 
-        if parsed.get("is_order"):
-            # Pass complaint status correctly to the sheet logger
-            status = "COMPLAINT" if parsed.get("is_complaint") else "New"
-            log_order(
-                phone=phone,
-                order_items=parsed.get("items", ""),
-                total=f"KES {parsed.get('total', '')}",
-                order_type=parsed.get("order_type", "Unknown"),
-                raw_message=raw_message,
-                status=status,
-            )
+        if not parsed.get("is_order"):
+            return
+
+        items = parsed.get("items", "").strip()
+        total = parsed.get("total", "").strip()
+
+        # Skip empty or clearly invalid extractions
+        if not items or not total or total == "0" or items == "...":
+            print(f"⚠ Skipping empty order log for {phone}")
+            return
+
+        # Deduplicate — don't log the same order twice in a row for same customer
+        last_log = getattr(detect_and_log_order, "_last_log", {})
+        order_key = f"{phone}:{items}:{total}"
+        if last_log.get("key") == order_key:
+            print(f"⚠ Duplicate order skipped for {phone}")
+            return
+
+        detect_and_log_order._last_log = {"key": order_key}
+
+        status = "COMPLAINT" if parsed.get("is_complaint") else "New"
+        log_order(
+            phone=phone,
+            order_items=items,
+            total=f"KES {total}",
+            order_type=parsed.get("order_type", "Unknown"),
+            raw_message=raw_message,
+            status=status,
+        )
 
     except json.JSONDecodeError:
         print(f"⚠ Order detection returned invalid JSON for {phone}")
     except Exception as e:
         print(f"⚠ Order detection error for {phone}: {e}")
-
 
 # ── 5. ROUTES ──────────────────────────────────────────────────────────────────
 @app.on_event("startup")
