@@ -4,15 +4,10 @@ from datetime import datetime
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-# --- CONFIGURATION ---
 SPREADSHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SHEET_NAME = "Orders"
-GOOGLE_JSON_STR = os.getenv("GOOGLE_CREDENTIALS_JSON")
-CREDENTIALS_FILE = "google_credentials.json"
-
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# Updated columns to match the new business logic
 COLUMNS = [
     "Timestamp",
     "Phone",
@@ -20,75 +15,91 @@ COLUMNS = [
     "Total (KES)",
     "Order Type",
     "Raw Message",
-    "Status",  # This will now hold "New" or "COMPLAINT"
+    "Status",
 ]
 
+
 def _get_sheets_service():
-    """Helper to authenticate with Google Sheets API."""
+    """
+    Authenticates with Google Sheets.
+    Production (Railway): reads from GOOGLE_CREDENTIALS_JSON env variable.
+    Development (local): reads from google_credentials.json file.
+    """
     try:
-        if GOOGLE_JSON_STR:
-            # Use credentials from Railway environment variable
-            creds_dict = json.loads(GOOGLE_JSON_STR)
+        creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+
+        if creds_json:
+            creds_dict = json.loads(creds_json)
             creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
         else:
-            # Fallback for local development
-            creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
+            creds = Credentials.from_service_account_file(
+                "google_credentials.json", scopes=SCOPES
+            )
 
         service = build("sheets", "v4", credentials=creds)
         return service.spreadsheets()
 
     except Exception as e:
-        print("❌ Google Auth Error:", e)
+        print(f"❌ Google Auth Error: {e}")
         return None
 
+
 def setup_sheet_headers():
-    """Ensures the sheet has the correct headers on startup."""
+    """Sets up column headers on first run. Safe to call on every startup."""
     try:
         sheet = _get_sheets_service()
         if not sheet:
+            print("⚠ Sheets unavailable — skipping header setup")
             return
 
-        # Check if row 1 already has content
         result = sheet.values().get(
             spreadsheetId=SPREADSHEET_ID,
             range=f"{SHEET_NAME}!A1:G1",
         ).execute()
 
         if result.get("values"):
-            return # Headers already exist
+            print("✓ Sheet headers already exist")
+            return
 
-        # If empty, create headers
         sheet.values().update(
             spreadsheetId=SPREADSHEET_ID,
             range=f"{SHEET_NAME}!A1",
             valueInputOption="RAW",
             body={"values": [COLUMNS]},
         ).execute()
-        print("✓ Sheet headers ready")
+
+        print("✓ Google Sheet headers created")
 
     except Exception as e:
-        print("⚠ Header setup failed:", e)
+        print(f"⚠ Header setup failed: {e}")
 
-def log_order(phone, order_items, total, order_type, raw_message, status="New"):
+
+def log_order(
+    phone: str,
+    order_items: str,
+    total: str,
+    order_type: str,
+    raw_message: str,
+    status: str = "New",   # "New" or "COMPLAINT"
+):
     """
-    Logs a new order or complaint to the Google Sheet.
-    Added 'status' parameter to support the new 'COMPLAINT' detection.
+    Appends one row to the Google Sheet for every confirmed order.
+    Never crashes the bot — all errors are caught.
     """
     try:
         sheet = _get_sheets_service()
         if not sheet:
-            print("⚠ Cannot log: Google Sheets service unavailable.")
+            print(f"⚠ Cannot log order for {phone} — Sheets unavailable")
             return
 
-        # Prepare the row data
         row = [
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             phone,
             order_items,
             total,
             order_type,
-            raw_message[:300], # Slightly longer message snippet for context
-            status,             # Successfully logs 'New' or 'COMPLAINT'
+            raw_message[:300],
+            status,
         ]
 
         sheet.values().append(
@@ -99,7 +110,7 @@ def log_order(phone, order_items, total, order_type, raw_message, status="New"):
             body={"values": [row]},
         ).execute()
 
-        print(f"✓ {status} logged for: {phone}")
+        print(f"✓ {status} logged for: {phone} — {order_items}")
 
     except Exception as e:
         print(f"⚠ Logging failed for {phone}: {e}")

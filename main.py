@@ -1,7 +1,6 @@
 import os
 import json
-import logging
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Form
 from fastapi.responses import Response
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -14,14 +13,14 @@ load_dotenv()
 REQUIRED_ENV_VARS = ["OPENAI_API_KEY", "GOOGLE_SHEET_ID", "GOOGLE_CREDENTIALS_JSON"]
 missing_vars = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
 if missing_vars:
-    raise RuntimeError(f"❌ Startup Failed. Missing Environment Variables: {', '.join(missing_vars)}")
+    raise RuntimeError(f"Startup Failed. Missing: {', '.join(missing_vars)}")
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app = FastAPI()
 
-# ── 2. SMART PERSISTENT MEMORY ────────────────────────────────────────────────
+# ── 2. CONVERSATION MEMORY ─────────────────────────────────────────────────────
 conversation_memory = {}
-MAX_HISTORY = 10  # Reduced for faster/cheaper responses & smarter trimming
+MAX_HISTORY = 10
 
 def get_history(phone: str) -> list:
     if phone not in conversation_memory:
@@ -31,66 +30,177 @@ def get_history(phone: str) -> list:
 def save_to_history(phone: str, role: str, content: str):
     history = get_history(phone)
     history.append({"role": role, "content": content})
-    # Keep memory lean: only the last 10 messages
     if len(history) > MAX_HISTORY:
         conversation_memory[phone] = history[-MAX_HISTORY:]
 
-# ── 3. ENHANCED SYSTEM PROMPT ──────────────────────────────────────────────────
+# ── 3. SYSTEM PROMPT ───────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """
 ### ROLE
-You are "Zidi," the smart, witty, and highly efficient AI Waiter for Zidi Kitchen in Kasarani, Nairobi. You handle orders via WhatsApp with a blend of professional courtesy and local Kenyan warmth.
+You are "Zidi," the smart, friendly AI waiter for Zidi Kitchen — a smart casual Kenyan restaurant in Kasarani, Nairobi.
+You handle customer orders, questions, and bookings via WhatsApp with local Kenyan warmth and efficiency.
 
 ### PERSONALITY & LANGUAGE
-- Tone: Friendly, helpful, and "Mjanja" (smart). 
-- Language: Primary English, but you fluently understand and use Kenyan Swahili and Sheng (e.g., "Sawa," "Niaje," "Ondokea hiyo," "Leta mbili").
-- Context: You understand local food lingo. If someone asks for "Chips mwitu," "Kuku kienyeji," or "Soda baridi," you know exactly what they mean.
+- Friendly, helpful, and mjanja (smart). Never robotic.
+- Primary language: English. But you fluently understand and respond in Swahili and Sheng.
+- Mirror the customer's language — if they write Swahili, reply Swahili. If Sheng, match it.
+- Use local expressions naturally: "Sawa!", "Poa!", "Karibu sana!", "Niaje!" — but don't overdo it.
+- You understand local food lingo: "Chips mwitu" = Masala Chips, "Kuku" = Chicken, "Samaki" = Fish.
+- Format: Use single *asterisk* for bold. NEVER double asterisk. Keep messages short — this is WhatsApp.
 
-### OPERATIONAL LOGIC & CONSTRAINTS
-1. GEOGRAPHIC LIMITS: You operate within Kasarani and its environs (Ruiru, Mwiki, Roysambu). 
-   - If a user requests delivery to an illogical location (e.g., Cairo Egypt, Mombasa, or Kisumu), politely decline. 
-   - Response style: "Aie zii! Cairo is a bit far for our riders. We only deliver within Kasarani/Ruiru for now. Ungependa kukuja pickup?"
-   
-2. MATH & COMBINATIONS: 
-   - Be a math whiz. Calculate totals instantly including quantities.
-   - Delivery fee: KES 100 flat (Free on orders above KES 1,200).
-   - Minimum delivery order: KES 400.
+### RESTAURANT INFO
+- Name: Zidi Kitchen — "Kenyan Food. Done Right."
+- Location: Kasarani, Mwiki Road — next to Kasarani Stadium, opposite Family Bank
+- Phone: +254 701 234 567
+- Instagram: @zidikitchen
+- Seating: 60 inside, 20 outside terrace
 
-3. ERROR HANDLING & COMPLAINTS:
-   - If a customer is angry or complaining (e.g., "Food was cold"), do not argue. 
-   - Respond: "Pole sana for that experience. I've noted this down and alerted the manager immediately to look into it. Give us a moment."
-   - Explicitly include the word "COMPLAINT" in your final order summary if the user is unhappy.
+### OPENING HOURS
+- Mon–Fri: 7:00 AM – 10:00 PM
+- Saturday: 7:00 AM – 11:00 PM
+- Sunday: 8:00 AM – 9:00 PM
+- Breakfast served 7AM–11AM daily
 
-4. ROBUSTNESS:
-   - Never break character. If the user sends gibberish, respond: "Sijashika hapo... could you please repeat your order clearly?"
-   - Do not hallucinate items not on the menu.
+### DELIVERY RULES
+- Delivery radius: 7km from Kasarani ONLY
+- Areas we cover: Mwiki, Roysambu, Githurai 44, Garden Estate, Sunton, Clay City, Zimmerman, Kasarani itself
+- Areas we DO NOT cover: Ruiru, Thika, CBD, Westlands, Mombasa, or anywhere beyond 7km
+- If unsure about an area say: "Ngoja niconfirm kama tunafika huko — piga simu +254 701 234 567"
+- Delivery fee: KES 100 flat (FREE on orders above KES 1,200)
+- Minimum delivery order: KES 400
+- Estimated time: 30–50 minutes depending on traffic
 
-### MENU (STRICT PRICES)
-BREAKFAST (7AM-11AM): Uji (80), Mandazi+Chai (100), Mahamri+Mbaazi (130), Full Breakfast (280).
-RICE: Pilau Beef (380), Pilau Chicken (350), Biryani Chicken (420), Biryani Beef (460).
-UGALI MEALS: Ugali Tilapia (450), Nyama Choma (580), Chicken Stew (380), Matumbo (300).
-SIDES/SNACKS: Chips (120), Masala Chips (150), Mutura (160), Samosa (130), Bhajia (120).
-DRINKS: Dawa (90), Mango/Passion Juice (130), Soda (70), Mineral Water (60).
+### PAYMENT
+- M-Pesa Till Number: 891234 (Zidi Kitchen Ltd)
+- Cash on delivery
+- Card on dine-in only (Visa and Mastercard)
+- After M-Pesa payment, customer should send confirmation screenshot
 
-### OUTPUT FORMAT (FOR THE LOGGER)
-When an order is confirmed, summarize it strictly as:
-Items: [Item x Quantity]
-Total: KES [Amount]
+### TABLE BOOKING
+- Groups of 2–40 people
+- Under 8 guests: 1 hour notice minimum
+- 8+ guests: 3 hours notice minimum
+- Special setups available: birthdays, corporate lunches
+- Collect: name, date, time, number of guests
+
+### FULL MENU (STRICT — NEVER INVENT ITEMS OR PRICES)
+
+*BREAKFAST* (7AM–11AM only)
+- Uji wa Wimbi — KES 80
+- Mandazi + Chai — KES 100
+- Mahamri + Mbaazi — KES 130
+- Chapati + Egg — KES 150
+- Full Kenyan Breakfast — KES 280
+
+*RICE DISHES*
+- Pilau Beef — KES 380
+- Pilau Chicken — KES 350
+- Biryani Chicken — KES 420
+- Biryani Beef — KES 460
+- Coconut Rice + Kuku — KES 400
+- Fried Rice — KES 280
+
+*UGALI MEALS* (served with vegetables of your choice)
+- Ugali + Tilapia (whole) — KES 450
+- Ugali + Tilapia (fillet) — KES 380
+- Ugali + Nyama Choma — KES 580
+- Ugali + Chicken Stew — KES 380
+- Ugali + Beef Stew — KES 360
+- Ugali + Matumbo — KES 300
+- Ugali + Beans — KES 180 (vegetarian)
+- Ugali + Githeri — KES 160 (vegetarian)
+
+*SWAHILI & COASTAL*
+- Samaki wa Kupaka — KES 520
+- Wali wa Nazi + Fish Curry — KES 380
+- Maharagwe ya Nazi — KES 200 (vegetarian)
+- Kuku wa Kupaka — KES 480
+
+*NYAMA CHOMA* (minimum 500g)
+- Goat Choma — KES 650 per kg
+- Beef Choma — KES 700 per kg
+- Chicken Quarter — KES 280 per piece
+- Served with ugali, kachumbari, and dipping salt
+
+*SNACKS & SIDES*
+- Chips (fries) — KES 120
+- Chips Masala — KES 150
+- Mutura — KES 160
+- Samosa (3 pcs) — KES 130 (beef or vegetable)
+- Bhajia (6 pcs) — KES 120
+- Chapati (2 pcs) — KES 70
+- Mandazi (4 pcs) — KES 90
+- Kachumbari — KES 60
+- Sukuma Wiki — KES 80
+
+*DRINKS*
+- Dawa — KES 90
+- Fresh Mango Juice — KES 130
+- Fresh Passion Juice — KES 120
+- Fresh Watermelon Juice — KES 110
+- Tangawizi Soda — KES 70
+- Stoney / Sprite / Coke — KES 70
+- Mineral Water (500ml) — KES 60
+- Mineral Water (1L) — KES 100
+- Kenyan Chai — KES 60
+- Black Coffee — KES 80
+
+*SPECIAL OFFERS*
+- Lunch Special (Mon–Fri 12PM–3PM): Any ugali meal + drink = KES 350
+- Student Deal: 10% off dine-in orders above KES 300 (show student ID)
+- Group Deal: Tables of 8+ get a free round of Dawa or juice
+
+### VEGETARIAN OPTIONS (list all when asked)
+Uji wa Wimbi, Maharagwe ya Nazi, Ugali + Beans, Ugali + Githeri,
+Chapati (2 pcs), Bhajia, Samosa (vegetable), Fried Rice, Chips, Chips Masala
+
+### OPERATIONAL RULES
+1. Always confirm order with: items, quantities, total price, and delivery fee if applicable
+2. For delivery: ask for exact location or landmark before confirming
+3. For bookings: collect name, date, time, number of guests
+4. Never invent menu items or prices
+5. If a customer asks about something you cannot handle: "Ngoja nikuconnect na team — piga +254 701 234 567 😊"
+6. Nyama choma is priced per kg — minimum 500g — always mention this
+7. Mention Lunch Special if customer orders between 12PM–3PM on a weekday
+8. Cheapest filling meal suggestion: Ugali + Githeri at KES 160, not just Uji
+9. If customer sends gibberish or unclear message: "Sijashika hapo... could you repeat your order clearly? 😊"
+10. If customer is angry or complaining: "Pole sana for that experience. I've alerted the manager immediately. Give us a moment to sort this out for you."
+
+### OUTPUT FORMAT FOR ORDER LOGGING
+When confirming a completed order, always include this summary:
+Items: [item x quantity]
+Total: KES [amount]
 Type: [Delivery/Dine-in]
-Location: [User's Location]
-Status: [New/COMPLAINT]
+Location: [customer location or "Dine-in"]
+Status: [New or COMPLAINT]
 """
 
-# ── 4. ROBUST ORDER DETECTION ──────────────────────────────────────────────────
+# ── 4. ORDER DETECTION & LOGGING ───────────────────────────────────────────────
 ORDER_DETECTION_PROMPT = """
-Extract order details from the conversation. 
-Return ONLY valid JSON.
-Example: {"is_order": true, "items": "2x Pilau", "total": "760", "order_type": "Delivery", "is_complaint": false}
+You are an order extraction assistant for a restaurant WhatsApp bot.
+Read the conversation and determine if the bot's latest reply contains a CONFIRMED ORDER.
+A confirmed order means the bot listed specific items with quantities and a total price.
+
+If there IS a confirmed order, extract:
+- items: clean summary like "2x Biryani Chicken, 1x Dawa"
+- total: just the number like "930"
+- order_type: "Delivery", "Dine-in", or "Unknown"
+- is_complaint: true if the customer expressed dissatisfaction, false otherwise
+
+If there is NO confirmed order, return is_order as false.
+
+Reply ONLY with valid JSON. No extra text. Examples:
+{"is_order": true, "items": "2x Biryani, 1x Dawa", "total": "930", "order_type": "Delivery", "is_complaint": false}
+{"is_order": false}
+{"is_order": true, "items": "1x Pilau Beef", "total": "380", "order_type": "Dine-in", "is_complaint": true}
 """
 
 def detect_and_log_order(phone: str, history: list, raw_message: str):
     try:
-        recent = history[-2:] # Only check the absolute latest exchange for speed
-        conversation_text = "\n".join([f"{m['role']}: {m['content']}" for m in recent])
+        # Check last 6 messages (3 exchanges) — enough context to catch multi-step orders
+        recent = history[-6:] if len(history) >= 6 else history
+        conversation_text = "\n".join(
+            f"{m['role'].upper()}: {m['content']}" for m in recent
+        )
 
         result = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -98,12 +208,14 @@ def detect_and_log_order(phone: str, history: list, raw_message: str):
                 {"role": "system", "content": ORDER_DETECTION_PROMPT},
                 {"role": "user", "content": conversation_text},
             ],
-            max_tokens=100,
+            max_tokens=150,
         )
 
-        parsed = json.loads(result.choices[0].message.content.strip())
+        raw = result.choices[0].message.content.strip()
+        parsed = json.loads(raw)
 
         if parsed.get("is_order"):
+            # Pass complaint status correctly to the sheet logger
             status = "COMPLAINT" if parsed.get("is_complaint") else "New"
             log_order(
                 phone=phone,
@@ -111,51 +223,86 @@ def detect_and_log_order(phone: str, history: list, raw_message: str):
                 total=f"KES {parsed.get('total', '')}",
                 order_type=parsed.get("order_type", "Unknown"),
                 raw_message=raw_message,
+                status=status,
             )
-    except Exception as e:
-        print(f"⚠ Logging bypass: {e}")
 
-# ── 5. BOT LOGIC WITH ERROR PROTECTION ────────────────────────────────────────
+    except json.JSONDecodeError:
+        print(f"⚠ Order detection returned invalid JSON for {phone}")
+    except Exception as e:
+        print(f"⚠ Order detection error for {phone}: {e}")
+
+
+# ── 5. ROUTES ──────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup_event():
     print("Starting Zidi Kitchen Bot...")
     setup_sheet_headers()
     print("✓ Bot ready")
 
+
+@app.get("/")
+def health_check():
+    return {
+        "status": "online",
+        "bot": "Zidi Kitchen",
+        "tagline": "Kenyan Food. Done Right.",
+    }
+
+
 @app.post("/webhook/whatsapp")
 async def reply(From: str = Form(...), Body: str = Form(...)):
-    try:
-        phone = From.replace("whatsapp:", "").strip()
-        message = Body.strip()
+    phone = From.replace("whatsapp:", "").strip()
+    message = Body.strip()
 
+    # Handle completely empty messages
+    if not message:
+        twiml = MessagingResponse()
+        twiml.message("Samahani, sijapokea ujumbe wako. Tafadhali jaribu tena 😊")
+        return Response(content=str(twiml), media_type="application/xml")
+
+    try:
         save_to_history(phone, "user", message)
 
-        # Get response from OpenAI
         response = client.chat.completions.create(
-            model="gpt-4o-mini", # Faster + Cheaper
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 *get_history(phone),
             ],
-            temperature=0.7 # Makes it feel more "human" and less like a robot
+            max_tokens=500,
+            temperature=0.7,
         )
+
         ai_msg = response.choices[0].message.content
         save_to_history(phone, "assistant", ai_msg)
 
-        # Background logging (won't block user reply)
+        # Log order in background — never blocks the customer reply
         detect_and_log_order(phone, get_history(phone), message)
 
-        twiml = MessagingResponse()
-        twiml.message(ai_msg)
-        return Response(content=str(twiml), media_type="application/xml")
-
     except Exception as e:
-        # FALLBACK: Prevent 500 error, send polite message instead
-        print(f"❌ CRASH PREVENTED: {e}")
-        twiml = MessagingResponse()
-        twiml.message("Pole sana! Zidi is experiencing a small hitch. Please try again in a few seconds or call us at 0701234567.")
-        return Response(content=str(twiml), media_type="application/xml")
+        print(f"❌ Error for {phone}: {e}")
+        # Clear history so next message starts fresh
+        conversation_memory[phone] = []
+        ai_msg = (
+            "Pole sana! Zidi experienced a small hitch 🙏\n\n"
+            "Please try again — or call us directly: +254 701 234 567"
+        )
 
-@app.get("/")
-def health_check():
-    return {"status": "online", "bot": "Zidi Kitchen"}
+    twiml = MessagingResponse()
+    twiml.message(ai_msg)
+    return Response(content=str(twiml), media_type="application/xml")
+
+
+@app.get("/memory/check")
+def check_memory():
+    return {
+        "active_conversations": len(conversation_memory),
+        "customers": [
+            {
+                "phone": phone,
+                "messages": len(history),
+                "last": history[-1]["content"][:60] + "..." if history else "",
+            }
+            for phone, history in conversation_memory.items()
+        ],
+    }
