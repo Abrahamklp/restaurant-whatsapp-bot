@@ -71,7 +71,7 @@ You handle customer orders, questions, and bookings via WhatsApp with local Keny
 
 ### PAYMENT
 - M-Pesa Till Number: 891234 (Zidi Kitchen Ltd)
-- Cash on delivery
+- Payment before delivery
 - Card on dine-in only (Visa and Mastercard)
 - After M-Pesa payment, customer should send confirmation screenshot
 
@@ -179,19 +179,20 @@ ORDER_DETECTION_PROMPT = """
 You are an order extraction assistant for a restaurant WhatsApp bot.
 Read the conversation and determine if the bot's latest reply contains a CONFIRMED ORDER.
 A confirmed order means the bot listed specific items with quantities and a total price.
-
+ 
 If there IS a confirmed order, extract:
 - items: clean summary like "2x Biryani Chicken, 1x Dawa"
 - total: just the number like "930"
 - order_type: "Delivery", "Dine-in", or "Unknown"
+- location: customer's delivery location or landmark if mentioned, else "Not specified"
 - is_complaint: true if the customer expressed dissatisfaction, false otherwise
-
+ 
 If there is NO confirmed order, return is_order as false.
-
+ 
 Reply ONLY with valid JSON. No extra text. Examples:
-{"is_order": true, "items": "2x Biryani, 1x Dawa", "total": "930", "order_type": "Delivery", "is_complaint": false}
+{"is_order": true, "items": "2x Biryani, 1x Dawa", "total": "930", "order_type": "Delivery", "location": "Roysambu near Equity", "is_complaint": false}
 {"is_order": false}
-{"is_order": true, "items": "1x Pilau Beef", "total": "380", "order_type": "Dine-in", "is_complaint": true}
+{"is_order": true, "items": "1x Pilau Beef", "total": "380", "order_type": "Dine-in", "location": "Not specified", "is_complaint": true}
 """
 
 def detect_and_log_order(phone: str, history: list, raw_message: str):
@@ -200,7 +201,7 @@ def detect_and_log_order(phone: str, history: list, raw_message: str):
         conversation_text = "\n".join(
             f"{m['role'].upper()}: {m['content']}" for m in recent
         )
-
+ 
         result = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -209,31 +210,31 @@ def detect_and_log_order(phone: str, history: list, raw_message: str):
             ],
             max_tokens=150,
         )
-
+ 
         raw = result.choices[0].message.content.strip()
         parsed = json.loads(raw)
-
+ 
         if not parsed.get("is_order"):
             return
-
+ 
         items = parsed.get("items", "").strip()
         total = parsed.get("total", "").strip()
-
-        # Skip empty or clearly invalid extractions
+ 
+        # Skip empty or invalid extractions
         if not items or not total or total == "0" or items == "...":
             print(f"⚠ Skipping empty order log for {phone}")
             return
-
-        # Deduplicate — don't log the same order twice in a row for same customer
+ 
+        # Deduplicate — don't log the same order twice in a row
         last_log = getattr(detect_and_log_order, "_last_log", {})
         order_key = f"{phone}:{items}:{total}"
         if last_log.get("key") == order_key:
             print(f"⚠ Duplicate order skipped for {phone}")
             return
-
         detect_and_log_order._last_log = {"key": order_key}
-
+ 
         status = "COMPLAINT" if parsed.get("is_complaint") else "New"
+ 
         log_order(
             phone=phone,
             order_items=items,
@@ -241,12 +242,14 @@ def detect_and_log_order(phone: str, history: list, raw_message: str):
             order_type=parsed.get("order_type", "Unknown"),
             raw_message=raw_message,
             status=status,
+            location=parsed.get("location", "Not specified"),  # ← NEW
         )
-
+ 
     except json.JSONDecodeError:
         print(f"⚠ Order detection returned invalid JSON for {phone}")
     except Exception as e:
         print(f"⚠ Order detection error for {phone}: {e}")
+ 
 
 # ── 5. ROUTES ──────────────────────────────────────────────────────────────────
 @app.on_event("startup")
