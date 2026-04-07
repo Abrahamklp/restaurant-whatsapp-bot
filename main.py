@@ -1,237 +1,220 @@
-"""
-Google Sheets Order Logger
-===========================
-Multi-client ready — accepts sheet_id and owner_number as arguments.
-Each restaurant logs to their own sheet and notifies their own owner.
-"""
-
 import os
 import json
-import traceback
-from datetime import datetime
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from twilio.rest import Client as TwilioClient
+from fastapi import FastAPI, Form
+from fastapi.responses import Response
+from openai import OpenAI
+from dotenv import load_dotenv
+from twilio.twiml.messaging_response import MessagingResponse
+from sheets_logger import log_order, setup_sheet_headers
+from restaurant_configs import get_restaurant_config, build_system_prompt
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-SHEET_NAME = "Orders"
+load_dotenv()
 
-COLUMNS = [
-    "Timestamp",
-    "Phone",
-    "Order Items",
-    "Total (KES)",
-    "Order Type",
-    "Location",
-    "Raw Message",
-    "Status",
-]
+# ── Startup Validation ─────────────────────────────────────────────────────────
+REQUIRED = ["OPENAI_API_KEY", "GOOGLE_CREDENTIALS_JSON"]
+missing = [v for v in REQUIRED if not os.getenv(v)]
+if missing:
+    raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
 
-TWILIO_SID   = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_FROM  = "whatsapp:+14155238886"
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+app = FastAPI()
 
+# ── Conversation Memory ────────────────────────────────────────────────────────
+# Key = phone number, Value = list of messages
+# Each customer's history is stored separately regardless of which restaurant they contact
+conversation_memory = {}
+MAX_HISTORY = 10
 
-def _get_sheets_service():
-    """Authenticates with Google Sheets API."""
-    try:
-        creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
-        if creds_json:
-            creds = Credentials.from_service_account_info(
-                json.loads(creds_json), scopes=SCOPES
-            )
-        else:
-            creds = Credentials.from_service_account_file(
-                "google_credentials.json", scopes=SCOPES
-            )
-        return build("sheets", "v4", credentials=creds).spreadsheets()
-    except Exception as e:
-        print(f"❌ Google Auth Error: {e}")
-        traceback.print_exc()
-        return None
+def get_history(phone: str) -> list:
+    if phone not in conversation_memory:
+        conversation_memory[phone] = []
+    return conversation_memory[phone]
+
+def save_to_history(phone: str, role: str, content: str):
+    history = get_history(phone)
+    history.append({"role": role, "content": content})
+    if len(history) > MAX_HISTORY:
+        conversation_memory[phone] = history[-MAX_HISTORY:]
 
 
-def setup_sheet_headers(sheet_id: str):
+# ── Order Detection ────────────────────────────────────────────────────────────
+ORDER_DETECTION_PROMPT = """
+You are an order extraction assistant for a restaurant WhatsApp bot.
+Read the conversation and determine if the bot's latest reply contains a CONFIRMED ORDER.
+A confirmed order means the bot listed specific items with quantities and a total price.
+
+If there IS a confirmed order extract:
+- items: clean summary like "2x Biryani Chicken, 1x Dawa"
+- total: just the number like "930"
+- order_type: "Delivery", "Dine-in", or "Unknown"
+- location: customer delivery location or landmark if mentioned, else "Not specified"
+- is_complaint: true if customer expressed dissatisfaction, false otherwise
+
+If NO confirmed order, return is_order as false.
+
+Reply ONLY with valid JSON. No extra text.
+Examples:
+{"is_order": true, "items": "2x Biryani, 1x Dawa", "total": "930", "order_type": "Delivery", "location": "Roysambu near Equity", "is_complaint": false}
+{"is_order": false}
+"""
+
+def detect_and_log_order(
+    phone: str,
+    history: list,
+    raw_message: str,
+    config: dict,
+):
     """
-    Sets up column headers for a specific sheet.
-    Call once per client on startup.
+    Checks if the latest bot reply contains a confirmed order.
+    If yes — logs to this restaurant's sheet and notifies their owner.
+    Owner notification ONLY fires here, protecting the daily message limit.
     """
     try:
-        sheet = _get_sheets_service()
-        if not sheet:
+        recent = history[-6:] if len(history) >= 6 else history
+        conversation_text = "\n".join(
+            f"{m['role'].upper()}: {m['content']}" for m in recent
+        )
+
+        result = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": ORDER_DETECTION_PROMPT},
+                {"role": "user", "content": conversation_text},
+            ],
+            max_tokens=150,
+        )
+
+        parsed = json.loads(result.choices[0].message.content.strip())
+
+        if not parsed.get("is_order"):
             return
 
-        result = sheet.values().get(
-            spreadsheetId=sheet_id,
-            range=f"{SHEET_NAME}!A1:H1",
-        ).execute()
+        items = parsed.get("items", "").strip()
+        total = parsed.get("total", "").strip()
 
-        if result.get("values"):
-            return  # Headers already exist
+        # Skip empty or invalid extractions
+        if not items or not total or total == "0" or "..." in items:
+            print(f"⚠ Skipping empty order for {phone}")
+            return
 
-        sheet.values().update(
-            spreadsheetId=sheet_id,
-            range=f"{SHEET_NAME}!A1",
-            valueInputOption="RAW",
-            body={"values": [COLUMNS]},
-        ).execute()
+        # Deduplicate — never log the same order twice in a row
+        last = getattr(detect_and_log_order, "_last", {})
+        key = f"{phone}:{items}:{total}"
+        if last.get("key") == key:
+            print(f"⚠ Duplicate skipped for {phone}")
+            return
+        detect_and_log_order._last = {"key": key}
 
-        print(f"✓ Sheet headers created for sheet: {sheet_id[:20]}...")
+        status = "COMPLAINT" if parsed.get("is_complaint") else "New"
 
-    except Exception as e:
-        print(f"⚠ Header setup failed for {sheet_id[:20]}: {e}")
-        traceback.print_exc()
-
-
-def _notify_owner(
-    owner_number: str,
-    phone: str,
-    order_items: str,
-    total: str,
-    order_type: str,
-    location: str,
-    timestamp: str,
-    status: str,
-    restaurant_name: str,
-):
-    """
-    Sends ONE WhatsApp notification to the restaurant owner.
-    Only called when is_order is True — never for regular messages.
-    This protects your Twilio daily message limit.
-    """
-    # ── DEBUG: Print all relevant env values ──────────────────────────────────
-    print(f"DEBUG ► owner_number   = '{owner_number}'")
-    print(f"DEBUG ► TWILIO_SID     = '{TWILIO_SID[:8] + '...' if TWILIO_SID else 'NOT SET'}'")
-    print(f"DEBUG ► TWILIO_TOKEN   = '{TWILIO_TOKEN[:8] + '...' if TWILIO_TOKEN else 'NOT SET'}'")
-    print(f"DEBUG ► TWILIO_FROM    = '{TWILIO_FROM}'")
-    print(f"DEBUG ► to (will send) = 'whatsapp:{owner_number}'")
-
-    if not owner_number:
-        print("⚠ No owner number configured — skipping notification")
-        print("  → Set ZIDI_OWNER_NUMBER or OWNER_WHATSAPP_NUMBER in Railway environment variables")
-        return
-
-    if not TWILIO_SID:
-        print("⚠ TWILIO_ACCOUNT_SID is not set — skipping notification")
-        print("  → Add TWILIO_ACCOUNT_SID to Railway environment variables")
-        return
-
-    if not TWILIO_TOKEN:
-        print("⚠ TWILIO_AUTH_TOKEN is not set — skipping notification")
-        print("  → Add TWILIO_AUTH_TOKEN to Railway environment variables")
-        return
-
-    try:
-        emoji = "🚨" if status == "COMPLAINT" else "🔔"
-        status_line = "COMPLAINT — Please follow up!" if status == "COMPLAINT" else "New order received ✅"
-
-        body = (
-            f"{emoji} *{restaurant_name} — {status_line}*\n\n"
-            f"👤 Customer: {phone}\n"
-            f"🍽️ Items: {order_items}\n"
-            f"💰 Total: {total}\n"
-            f"📦 Type: {order_type}\n"
-            f"📍 Location: {location}\n"
-            f"🕐 Time: {timestamp}"
+        # Pass restaurant-specific sheet and owner — multi-client routing
+        log_order(
+            phone=phone,
+            order_items=items,
+            total=f"KES {total}",
+            order_type=parsed.get("order_type", "Unknown"),
+            raw_message=raw_message,
+            sheet_id=config["sheet_id"],
+            owner_number=config["owner_number"],
+            restaurant_name=config["name"],
+            status=status,
+            location=parsed.get("location", "Not specified"),
         )
 
-        print(f"DEBUG ► Attempting Twilio send to whatsapp:{owner_number} ...")
+    except json.JSONDecodeError:
+        print(f"⚠ Order detection: invalid JSON for {phone}")
+    except Exception as e:
+        print(f"⚠ Order detection error for {phone}: {e}")
 
-        twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
-        msg = twilio_client.messages.create(
-            from_=TWILIO_FROM,
-            to=f"whatsapp:{owner_number}",
-            body=body,
+
+# ── Startup ────────────────────────────────────────────────────────────────────
+@app.on_event("startup")
+async def startup_event():
+    print("Starting Multi-Client Restaurant Bot...")
+    from restaurant_configs import RESTAURANT_CONFIGS
+    for number, config in RESTAURANT_CONFIGS.items():
+        if config.get("sheet_id"):
+            setup_sheet_headers(config["sheet_id"])
+            print(f"✓ {config['name']} ready")
+    print("✓ All restaurants online")
+
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+@app.get("/")
+def health():
+    from restaurant_configs import RESTAURANT_CONFIGS
+    return {
+        "status": "online",
+        "restaurants": [c["name"] for c in RESTAURANT_CONFIGS.values()],
+    }
+
+
+@app.post("/webhook/whatsapp")
+async def reply(
+    From: str = Form(...),   # Customer's number
+    To: str = Form(...),     # Twilio number that received the message — used for routing
+    Body: str = Form(...),
+):
+    phone = From.replace("whatsapp:", "").strip()
+    message = Body.strip()
+
+    # ── Route to correct restaurant based on which Twilio number was messaged ──
+    config = get_restaurant_config(To)
+    system_prompt = build_system_prompt(config)
+
+    # Handle empty messages
+    if not message:
+        twiml = MessagingResponse()
+        twiml.message("Samahani, sijapokea ujumbe wako. Tafadhali jaribu tena 😊")
+        return Response(content=str(twiml), media_type="application/xml")
+
+    try:
+        save_to_history(phone, "user", message)
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                *get_history(phone),
+            ],
+            max_tokens=500,
+            temperature=0.7,
         )
 
-        print(f"✓ Owner notified at {owner_number}")
-        print(f"DEBUG ► Twilio message SID: {msg.sid}")
-        print(f"DEBUG ► Twilio message status: {msg.status}")
+        ai_msg = response.choices[0].message.content
+        save_to_history(phone, "assistant", ai_msg)
+
+        # Check for confirmed order — only place owner gets notified
+        detect_and_log_order(
+            phone=phone,
+            history=get_history(phone),
+            raw_message=message,
+            config=config,
+        )
 
     except Exception as e:
-        print(f"⚠ Owner notification failed: {e}")
-        print(f"  → Error type: {type(e).__name__}")
-        traceback.print_exc()
-        print("\n  COMMON FIXES:")
-        print("  1. Has +{} sent 'join <keyword>' to the sandbox? (Twilio trial requirement)".format(owner_number))
-        print("  2. Is TWILIO_ACCOUNT_SID correct? Check Twilio Console → Account Info")
-        print("  3. Is TWILIO_AUTH_TOKEN correct? Check Twilio Console → Account Info")
-        print("  4. Is the owner number in E.164 format? e.g. +254713348005 (no spaces)")
+        print(f"❌ Error for {phone}: {e}")
+        conversation_memory[phone] = []
+        ai_msg = (
+            "Pole sana! Experienced a small hitch 🙏\n\n"
+            f"Please try again or call us: {config.get('phone', '')}"
+        )
+
+    twiml = MessagingResponse()
+    twiml.message(ai_msg)
+    return Response(content=str(twiml), media_type="application/xml")
 
 
-def log_order(
-    phone: str,
-    order_items: str,
-    total: str,
-    order_type: str,
-    raw_message: str,
-    sheet_id: str,          # ← per-client sheet ID passed as argument
-    owner_number: str,      # ← per-client owner number passed as argument
-    restaurant_name: str,   # ← for the owner notification message
-    status: str = "New",
-    location: str = "Not specified",
-):
-    """
-    1. Logs order to the correct Google Sheet for this restaurant.
-    2. Notifies this restaurant's owner on WhatsApp.
-
-    Both steps are independent — failure in one never affects the other.
-    Owner is only notified when this function is called (is_order = True).
-    """
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    logged_to_sheet = False
-
-    # ── DEBUG: Confirm log_order was called ───────────────────────────────────
-    print(f"DEBUG ► log_order called for {phone} | items={order_items} | total={total}")
-    print(f"DEBUG ► sheet_id={sheet_id[:20] + '...' if sheet_id else 'NOT SET'}")
-    print(f"DEBUG ► owner_number={owner_number!r}")
-    print(f"DEBUG ► restaurant_name={restaurant_name!r}")
-
-    # ── Step 1: Log to Google Sheets ──────────────────────────────────────────
-    try:
-        sheet = _get_sheets_service()
-        if not sheet:
-            print(f"⚠ Sheets unavailable — cannot log for {phone}")
-        else:
-            row = [
-                timestamp,
-                phone,
-                order_items,
-                total,
-                order_type,
-                location,
-                raw_message[:300],
-                status,
-            ]
-
-            sheet.values().append(
-                spreadsheetId=sheet_id,
-                range=f"{SHEET_NAME}!A1",
-                valueInputOption="RAW",
-                insertDataOption="INSERT_ROWS",
-                body={"values": [row]},
-            ).execute()
-
-            logged_to_sheet = True
-            print(f"✓ {status} logged — {phone}: {order_items}")
-
-    except Exception as e:
-        print(f"⚠ Sheet logging failed for {phone}: {e}")
-        traceback.print_exc()
-
-    # ── Step 2: Notify Owner ──────────────────────────────────────────────────
-    # NOTE: Owner notification now fires whether or not sheet logging succeeded.
-    # This ensures you always get notified even if Sheets has a temporary issue.
-    print(f"DEBUG ► Sheet logged: {logged_to_sheet} — proceeding to owner notification regardless")
-
-    _notify_owner(
-        owner_number=owner_number,
-        phone=phone,
-        order_items=order_items,
-        total=total,
-        order_type=order_type,
-        location=location,
-        timestamp=timestamp,
-        status=status,
-        restaurant_name=restaurant_name,
-    )
+@app.get("/memory/check")
+def check_memory():
+    return {
+        "active_conversations": len(conversation_memory),
+        "customers": [
+            {
+                "phone": p,
+                "messages": len(h),
+                "last": h[-1]["content"][:60] + "..." if h else "",
+            }
+            for p, h in conversation_memory.items()
+        ],
+    }
