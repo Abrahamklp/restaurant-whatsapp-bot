@@ -127,6 +127,16 @@ def _notify_owner(
 
     except Exception as e:
         print(f"⚠ Owner notification failed: {e}")
+        # Add this to see the full error:
+        import traceback
+        traceback.print_exc()
+    def _notify_owner(owner_number, ...):
+     print(f"DEBUG owner_number='{owner_number}'")
+     print(f"DEBUG TWILIO_SID='{TWILIO_SID[:8] if TWILIO_SID else None}'")
+     print(f"DEBUG TWILIO_TOKEN='{TWILIO_TOKEN[:8] if TWILIO_TOKEN else None}'")
+    
+    if not owner_number:
+        ...    
 
 
 def log_order(
