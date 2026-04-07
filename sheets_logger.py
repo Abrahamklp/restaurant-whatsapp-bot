@@ -1,3 +1,10 @@
+"""
+Google Sheets Order Logger
+===========================
+Multi-client ready — accepts sheet_id and owner_number as arguments.
+Each restaurant logs to their own sheet and notifies their own owner.
+"""
+
 import os
 import json
 from datetime import datetime
@@ -5,10 +12,8 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from twilio.rest import Client as TwilioClient
 
-# ── Google Sheets Config ───────────────────────────────────────────────────────
-SPREADSHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-SHEET_NAME = "Orders"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SHEET_NAME = "Orders"
 
 COLUMNS = [
     "Timestamp",
@@ -16,49 +21,67 @@ COLUMNS = [
     "Order Items",
     "Total (KES)",
     "Order Type",
+    "Location",
     "Raw Message",
     "Status",
 ]
 
-# ── Twilio Config ──────────────────────────────────────────────────────────────
-TWILIO_SID    = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_FROM   = "whatsapp:+14155238886"   # Your Twilio sandbox number
-
-# The owner's WhatsApp number — receives a notification on every new order
-# Set this as an environment variable OWNER_WHATSAPP_NUMBER in Railway and .env
-# Format: +254712345678  (no spaces, include country code)
-OWNER_NUMBER  = os.getenv("OWNER_WHATSAPP_NUMBER")
+TWILIO_SID   = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_FROM  = "whatsapp:+14155238886"
 
 
-# ── Google Sheets Auth ─────────────────────────────────────────────────────────
 def _get_sheets_service():
-    """
-    Authenticates with Google Sheets.
-    Production: reads from GOOGLE_CREDENTIALS_JSON env variable.
-    Development: reads from google_credentials.json file.
-    """
+    """Authenticates with Google Sheets API."""
     try:
         creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
-
         if creds_json:
-            creds_dict = json.loads(creds_json)
-            creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+            creds = Credentials.from_service_account_info(
+                json.loads(creds_json), scopes=SCOPES
+            )
         else:
             creds = Credentials.from_service_account_file(
                 "google_credentials.json", scopes=SCOPES
             )
-
-        service = build("sheets", "v4", credentials=creds)
-        return service.spreadsheets()
-
+        return build("sheets", "v4", credentials=creds).spreadsheets()
     except Exception as e:
         print(f"❌ Google Auth Error: {e}")
         return None
 
 
-# ── WhatsApp Owner Notification ────────────────────────────────────────────────
+def setup_sheet_headers(sheet_id: str):
+    """
+    Sets up column headers for a specific sheet.
+    Call once per client on startup.
+    """
+    try:
+        sheet = _get_sheets_service()
+        if not sheet:
+            return
+
+        result = sheet.values().get(
+            spreadsheetId=sheet_id,
+            range=f"{SHEET_NAME}!A1:H1",
+        ).execute()
+
+        if result.get("values"):
+            return  # Headers already exist
+
+        sheet.values().update(
+            spreadsheetId=sheet_id,
+            range=f"{SHEET_NAME}!A1",
+            valueInputOption="RAW",
+            body={"values": [COLUMNS]},
+        ).execute()
+
+        print(f"✓ Sheet headers created for sheet: {sheet_id[:20]}...")
+
+    except Exception as e:
+        print(f"⚠ Header setup failed for {sheet_id[:20]}: {e}")
+
+
 def _notify_owner(
+    owner_number: str,
     phone: str,
     order_items: str,
     total: str,
@@ -66,104 +89,73 @@ def _notify_owner(
     location: str,
     timestamp: str,
     status: str,
+    restaurant_name: str,
 ):
     """
-    Sends a WhatsApp notification to the restaurant owner
-    every time a new order is confirmed.
-    Silently skips if OWNER_WHATSAPP_NUMBER is not set.
-    Never crashes the bot — all errors are caught.
+    Sends ONE WhatsApp notification to the restaurant owner.
+    Only called when is_order is True — never for regular messages.
+    This protects your Twilio daily message limit.
     """
-    if not OWNER_NUMBER:
-        print("⚠ OWNER_WHATSAPP_NUMBER not set — skipping owner notification")
+    if not owner_number:
+        print("⚠ No owner number configured — skipping notification")
         return
 
     if not TWILIO_SID or not TWILIO_TOKEN:
-        print("⚠ Twilio credentials missing — skipping owner notification")
+        print("⚠ Twilio credentials missing — skipping notification")
         return
 
     try:
-        # Build the notification message
         emoji = "🚨" if status == "COMPLAINT" else "🔔"
-        status_line = "⚠️ COMPLAINT — Please follow up!" if status == "COMPLAINT" else "✅ New order received"
+        status_line = "COMPLAINT — Please follow up!" if status == "COMPLAINT" else "New order received ✅"
 
-        message_body = (
-            f"{emoji} *ZIDI KITCHEN — {status_line}*\n\n"
+        body = (
+            f"{emoji} *{restaurant_name} — {status_line}*\n\n"
             f"👤 Customer: {phone}\n"
             f"🍽️ Items: {order_items}\n"
             f"💰 Total: {total}\n"
             f"📦 Type: {order_type}\n"
             f"📍 Location: {location}\n"
-            f"🕐 Time: {timestamp}\n\n"
-            f"Reply to customer on WhatsApp or call them directly."
+            f"🕐 Time: {timestamp}"
         )
 
-        twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
-        twilio_client.messages.create(
+        TwilioClient(TWILIO_SID, TWILIO_TOKEN).messages.create(
             from_=TWILIO_FROM,
-            to=f"whatsapp:{OWNER_NUMBER}",
-            body=message_body,
+            to=f"whatsapp:{owner_number}",
+            body=body,
         )
-
-        print(f"✓ Owner notified — {phone}: {order_items}")
-
-    except Exception as e:
-        # Never crash the bot if notification fails
-        print(f"⚠ Owner notification failed (order still logged): {e}")
-
-
-# ── Sheet Setup ────────────────────────────────────────────────────────────────
-def setup_sheet_headers():
-    """Sets up column headers on first run. Safe to call on every startup."""
-    try:
-        sheet = _get_sheets_service()
-        if not sheet:
-            print("⚠ Sheets unavailable — skipping header setup")
-            return
-
-        result = sheet.values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{SHEET_NAME}!A1:G1",
-        ).execute()
-
-        if result.get("values"):
-            print("✓ Sheet headers already exist")
-            return
-
-        sheet.values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{SHEET_NAME}!A1",
-            valueInputOption="RAW",
-            body={"values": [COLUMNS]},
-        ).execute()
-
-        print("✓ Google Sheet headers created")
+        print(f"✓ Owner notified at {owner_number}")
 
     except Exception as e:
-        print(f"⚠ Header setup failed: {e}")
+        print(f"⚠ Owner notification failed: {e}")
 
 
-# ── Main Log Function ──────────────────────────────────────────────────────────
 def log_order(
     phone: str,
     order_items: str,
     total: str,
     order_type: str,
     raw_message: str,
+    sheet_id: str,          # ← per-client sheet ID passed as argument
+    owner_number: str,      # ← per-client owner number passed as argument
+    restaurant_name: str,   # ← for the owner notification message
     status: str = "New",
     location: str = "Not specified",
 ):
     """
-    1. Appends one row to Google Sheets.
-    2. Sends a WhatsApp notification to the owner.
-    Both steps are independent — if one fails, the other still runs.
+    1. Logs order to the correct Google Sheet for this restaurant.
+    2. Notifies this restaurant's owner on WhatsApp.
+
+    Both steps are independent — failure in one never affects the other.
+    Owner is only notified when this function is called (is_order = True).
     """
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    logged_to_sheet = False
 
-    # ── Step 1: Log to Google Sheets ──
+    # ── Step 1: Log to Google Sheets ──────────────────────────────────────────
     try:
         sheet = _get_sheets_service()
         if not sheet:
-            print(f"⚠ Cannot log order for {phone} — Sheets unavailable")
+            print(f"⚠ Sheets unavailable — cannot log for {phone}")
         else:
             row = [
                 timestamp,
@@ -171,30 +163,36 @@ def log_order(
                 order_items,
                 total,
                 order_type,
+                location,
                 raw_message[:300],
                 status,
             ]
 
             sheet.values().append(
-                spreadsheetId=SPREADSHEET_ID,
+                spreadsheetId=sheet_id,
                 range=f"{SHEET_NAME}!A1",
                 valueInputOption="RAW",
                 insertDataOption="INSERT_ROWS",
                 body={"values": [row]},
             ).execute()
 
-            print(f"✓ {status} logged to sheet — {phone}: {order_items}")
+            logged_to_sheet = True
+            print(f"✓ {status} logged — {phone}: {order_items}")
 
     except Exception as e:
         print(f"⚠ Sheet logging failed for {phone}: {e}")
 
-    # ── Step 2: Notify Owner on WhatsApp ──
-    _notify_owner(
-        phone=phone,
-        order_items=order_items,
-        total=total,
-        order_type=order_type,
-        location=location,
-        timestamp=timestamp,
-        status=status,
-    )
+    # ── Step 2: Notify Owner (only if sheet log succeeded) ───────────────────
+    # We only notify if the order was actually logged — prevents ghost notifications
+    if logged_to_sheet:
+        _notify_owner(
+            owner_number=owner_number,
+            phone=phone,
+            order_items=order_items,
+            total=total,
+            order_type=order_type,
+            location=location,
+            timestamp=timestamp,
+            status=status,
+            restaurant_name=restaurant_name,
+        )
