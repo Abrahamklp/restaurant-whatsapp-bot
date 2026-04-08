@@ -7,7 +7,6 @@ Each restaurant logs to their own sheet and notifies their own owner.
 
 import os
 import json
-import traceback
 from datetime import datetime
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -47,7 +46,6 @@ def _get_sheets_service():
         return build("sheets", "v4", credentials=creds).spreadsheets()
     except Exception as e:
         print(f"❌ Google Auth Error: {e}")
-        traceback.print_exc()
         return None
 
 
@@ -64,7 +62,6 @@ def setup_sheet_headers(sheet_id: str):
         ).execute()
 
         if result.get("values"):
-            print(f"✓ Sheet headers already exist for: {sheet_id[:20]}...")
             return
 
         sheet.values().update(
@@ -74,11 +71,10 @@ def setup_sheet_headers(sheet_id: str):
             body={"values": [COLUMNS]},
         ).execute()
 
-        print(f"✓ Sheet headers created for: {sheet_id[:20]}...")
+        print(f"✓ Sheet headers created")
 
     except Exception as e:
         print(f"⚠ Header setup failed: {e}")
-        traceback.print_exc()
 
 
 def _notify_owner(
@@ -96,73 +92,38 @@ def _notify_owner(
     Sends ONE WhatsApp notification to the restaurant owner.
     Only called when is_order is True — protects Twilio daily limit.
     """
-    # ── GATE CHECKS ────────────────────────────────────────────────────────────
-    print(f"\n{'='*50}")
-    print(f"🔔 _notify_owner called")
-    print(f"   owner_number   : '{owner_number}'")
-    print(f"   restaurant     : '{restaurant_name}'")
-    print(f"   TWILIO_SID     : '{TWILIO_SID[:10]}...' " if TWILIO_SID else "   TWILIO_SID     : NOT SET ❌")
-    print(f"   TWILIO_TOKEN   : '{TWILIO_TOKEN[:10]}...' " if TWILIO_TOKEN else "   TWILIO_TOKEN   : NOT SET ❌")
-    print(f"   TWILIO_FROM    : '{TWILIO_FROM}'")
-    print(f"{'='*50}")
-
     if not owner_number:
-        print("⚠ SKIP: owner_number is empty or None")
-        print("  Fix: Set ZIDI_OWNER_NUMBER in Railway variables")
+        print("⚠ No owner number set — skipping notification")
         return
 
-    if not TWILIO_SID:
-        print("⚠ SKIP: TWILIO_ACCOUNT_SID not set")
-        print("  Fix: Add TWILIO_ACCOUNT_SID to Railway variables")
+    if not TWILIO_SID or not TWILIO_TOKEN:
+        print("⚠ Twilio credentials missing — skipping notification")
         return
-
-    if not TWILIO_TOKEN:
-        print("⚠ SKIP: TWILIO_AUTH_TOKEN not set")
-        print("  Fix: Add TWILIO_AUTH_TOKEN to Railway variables")
-        return
-
-    # ── BUILD MESSAGE ──────────────────────────────────────────────────────────
-    emoji = "🚨" if status == "COMPLAINT" else "🔔"
-    status_line = "COMPLAINT — Follow up needed!" if status == "COMPLAINT" else "New order ✅"
-
-    body = (
-        f"{emoji} *{restaurant_name} — {status_line}*\n\n"
-        f"👤 Customer: {phone}\n"
-        f"🍽️ Items: {order_items}\n"
-        f"💰 Total: {total}\n"
-        f"📦 Type: {order_type}\n"
-        f"📍 Location: {location}\n"
-        f"🕐 Time: {timestamp}"
-    )
-
-    to_number = f"whatsapp:{owner_number}"
-
-    # ── SEND ───────────────────────────────────────────────────────────────────
-    print(f"📤 Attempting send:")
-    print(f"   from : {TWILIO_FROM}")
-    print(f"   to   : {to_number}")
-    print(f"   body : {body[:80]}...")
 
     try:
-        twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
-        msg = twilio_client.messages.create(
+        emoji = "🚨" if status == "COMPLAINT" else "🔔"
+        status_line = "COMPLAINT — Follow up needed!" if status == "COMPLAINT" else "New order ✅"
+
+        body = (
+            f"{emoji} *{restaurant_name} — {status_line}*\n\n"
+            f"👤 Customer: {phone}\n"
+            f"🍽️ Items: {order_items}\n"
+            f"💰 Total: {total}\n"
+            f"📦 Type: {order_type}\n"
+            f"📍 Location: {location}\n"
+            f"🕐 Time: {timestamp}"
+        )
+
+        msg = TwilioClient(TWILIO_SID, TWILIO_TOKEN).messages.create(
             from_=TWILIO_FROM,
-            to=to_number,
+            to=f"whatsapp:{owner_number}",
             body=body,
         )
 
-        # If we reach here — Twilio accepted the message
-        print(f"✅ TWILIO ACCEPTED — SID: {msg.sid} | Status: {msg.status}")
-        print(f"   If message not received, check Twilio Console → Monitor → Logs → {msg.sid}")
+        print(f"✓ Owner notified — {msg.sid}")
 
     except Exception as e:
-        print(f"❌ TWILIO REJECTED — {type(e).__name__}: {e}")
-        traceback.print_exc()
-        print("\n  Possible causes:")
-        print(f"  1. +{owner_number} has not joined sandbox (send 'join ten-walk' to +14155238886)")
-        print(f"  2. Daily 50-message limit exceeded (check Twilio Console)")
-        print(f"  3. Twilio credentials are wrong or expired")
-        print(f"  4. Number format issue — expected: +254XXXXXXXXX (no spaces)")
+        print(f"⚠ Owner notification failed: {type(e).__name__}: {e}")
 
 
 def log_order(
@@ -181,29 +142,18 @@ def log_order(
     1. Logs order to this restaurant's Google Sheet.
     2. Notifies this restaurant's owner on WhatsApp.
     Both steps run independently — failure in one never blocks the other.
+    Owner is only notified when this function is called (is_order = True).
     """
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    print(f"\n{'='*50}")
-    print(f"📋 log_order called")
-    print(f"   phone          : {phone}")
-    print(f"   items          : {order_items}")
-    print(f"   total          : {total}")
-    print(f"   sheet_id       : {sheet_id[:20] + '...' if sheet_id else 'NOT SET ❌'}")
-    print(f"   owner_number   : '{owner_number}'")
-    print(f"   restaurant     : '{restaurant_name}'")
-    print(f"   status         : {status}")
-    print(f"{'='*50}")
-
     # ── Step 1: Log to Google Sheets ──────────────────────────────────────────
-    logged = False
     try:
         if not sheet_id:
-            print("⚠ sheet_id is empty — cannot log to sheet")
+            print(f"⚠ No sheet_id for {phone} — cannot log")
         else:
             sheet = _get_sheets_service()
             if not sheet:
-                print("⚠ Sheets service unavailable")
+                print(f"⚠ Sheets unavailable for {phone}")
             else:
                 row = [
                     timestamp,
@@ -224,16 +174,12 @@ def log_order(
                     body={"values": [row]},
                 ).execute()
 
-                logged = True
-                print(f"✅ Sheet logged: {order_items} for {phone}")
+                print(f"✓ {status} logged — {phone}: {order_items}")
 
     except Exception as e:
-        print(f"❌ Sheet logging failed: {e}")
-        traceback.print_exc()
+        print(f"⚠ Sheet logging failed for {phone}: {e}")
 
     # ── Step 2: Notify Owner ──────────────────────────────────────────────────
-    # Fires regardless of sheet logging success
-    print(f"\n📨 Proceeding to owner notification (sheet_logged={logged})")
     _notify_owner(
         owner_number=owner_number,
         phone=phone,
