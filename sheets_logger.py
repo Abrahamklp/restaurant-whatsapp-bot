@@ -8,6 +8,7 @@ Each restaurant logs to their own sheet and notifies their own owner.
 import os
 import json
 import traceback
+import time  # <--- Added for sandbox rate-limit handling
 from datetime import datetime
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -135,13 +136,17 @@ def _notify_owner(
         f"🕐 Time: {timestamp}"
     )
 
+    # Ensure the owner number is correctly prefixed for WhatsApp
     to_number = f"whatsapp:{owner_number}"
 
     # ── SEND ───────────────────────────────────────────────────────────────────
     print(f"📤 Attempting send:")
     print(f"   from : {TWILIO_FROM}")
     print(f"   to   : {to_number}")
-    print(f"   body : {body[:80]}...")
+    
+    # SAFETY DELAY: Bypasses Error 63038 (Rate limiting in Twilio Sandbox)
+    print("⏳ Sandbox Safety: Waiting 3 seconds before notifying owner...")
+    time.sleep(3)
 
     try:
         twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
@@ -158,11 +163,11 @@ def _notify_owner(
     except Exception as e:
         print(f"❌ TWILIO REJECTED — {type(e).__name__}: {e}")
         traceback.print_exc()
-        print("\n  Possible causes:")
-        print(f"  1. +{owner_number} has not joined sandbox (send 'join ten-walk' to +14155238886)")
-        print(f"  2. Daily 50-message limit exceeded (check Twilio Console)")
-        print(f"  3. Twilio credentials are wrong or expired")
-        print(f"  4. Number format issue — expected: +254XXXXXXXXX (no spaces)")
+        print("\n   Possible causes:")
+        print(f"   1. {owner_number} has not joined sandbox (send 'join [keyword]' to +14155238886)")
+        print(f"   2. Daily 50-message limit exceeded (check Twilio Console)")
+        print(f"   3. Twilio credentials are wrong or expired")
+        print(f"   4. Number format issue or not in Verified Caller IDs (Trial Account)")
 
 
 def log_order(
@@ -186,13 +191,13 @@ def log_order(
 
     print(f"\n{'='*50}")
     print(f"📋 log_order called")
-    print(f"   phone          : {phone}")
-    print(f"   items          : {order_items}")
-    print(f"   total          : {total}")
-    print(f"   sheet_id       : {sheet_id[:20] + '...' if sheet_id else 'NOT SET ❌'}")
-    print(f"   owner_number   : '{owner_number}'")
-    print(f"   restaurant     : '{restaurant_name}'")
-    print(f"   status         : {status}")
+    print(f"   phone           : {phone}")
+    print(f"   items           : {order_items}")
+    print(f"   total           : {total}")
+    print(f"   sheet_id        : {sheet_id[:20] + '...' if sheet_id else 'NOT SET ❌'}")
+    print(f"   owner_number    : '{owner_number}'")
+    print(f"   restaurant      : '{restaurant_name}'")
+    print(f"   status          : {status}")
     print(f"{'='*50}")
 
     # ── Step 1: Log to Google Sheets ──────────────────────────────────────────
